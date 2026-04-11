@@ -1,0 +1,9 @@
+{
+	"id": "pinned-tab-utils",
+	"name": "Pinned Tab Utils",
+	"version": "1.0.0",
+	"minAppVersion": "1.5.0",
+	"description": "Automatically moves pinned tabs to the left side of the tab bar, mimicking browser behaviour.",
+	"author": "roman",
+	"isDesktopOnly": true
+}
