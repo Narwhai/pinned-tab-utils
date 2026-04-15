@@ -1,49 +1,48 @@
 import { Plugin, WorkspaceLeaf } from "obsidian";
 
-interface WorkspaceLayoutLeaf {
-	id?: string;
-	type: "leaf";
-	pinned?: boolean;
-	state?: {
-		pinned?: boolean;
-		[key: string]: unknown;
-	};
-	[key: string]: unknown;
+/**
+ * Internal Obsidian types — not part of the public API but stable since 1.0.
+ * Used for targeted, non-destructive tab reordering.
+ */
+
+interface InternalLeaf extends WorkspaceLeaf {
+	pinned: boolean;
+	tabHeaderEl: HTMLElement;
+	containerEl: HTMLElement;
 }
 
-interface WorkspaceLayoutNode {
-	id?: string;
-	type: string;
-	children?: WorkspaceLayoutChild[];
-	currentTab?: number;
-	[key: string]: unknown;
+interface InternalTabGroup {
+	children: InternalLeaf[];
+	tabHeaderEls: HTMLElement[];
+	currentTab: number;
+	tabsInnerEl: HTMLElement;
+	containerEl: HTMLElement;
+	updateTabDisplay(): void;
 }
 
-type WorkspaceLayoutChild = WorkspaceLayoutLeaf | WorkspaceLayoutNode;
-
-interface WorkspaceLayoutSnapshot {
-	main?: WorkspaceLayoutNode;
-	left?: WorkspaceLayoutNode;
-	right?: WorkspaceLayoutNode;
-	floating?: WorkspaceLayoutNode[];
-	active?: string;
-	[key: string]: unknown;
+interface InternalSplitNode {
+	children: (InternalTabGroup | InternalSplitNode)[];
+	type?: string;
 }
 
 /**
  * Pinned Tab Utils — automatically moves pinned tabs to the left side of
  * the tab bar, mimicking browser behaviour.
  *
- * Uses the public Obsidian API to:
- * - detect pin changes via `leaf.on("pinned-change")`
- * - enumerate leaves via `workspace.iterateAllLeaves()`
- * - reorder tabs by rewriting the serialized workspace layout with
- *   `workspace.getLayout()` + `workspace.changeLayout()`
+ * Uses targeted internal-API manipulation to reorder tabs in-place:
+ * - Detects pin changes via `leaf.on("pinned-change")`
+ * - Walks `workspace.rootSplit` to find tab groups
+ * - Splices `children[]` in-place, syncs `tabHeaderEls`, `currentTab`,
+ *   and DOM nodes inside `tabsInnerEl`
+ *
+ * This preserves editor state (scroll position, cursor, undo history,
+ * selections) because the workspace is never torn down and rebuilt.
  */
 export default class PinnedTabUtilsPlugin extends Plugin {
 	private observedLeaves = new WeakSet<WorkspaceLeaf>();
 	private reorderScheduled = false;
-	private isApplyingLayout = false;
+	private isReordering = false;
+	private observeDebounceTimer: number | null = null;
 
 	async onload() {
 		this.app.workspace.onLayoutReady(() => {
@@ -53,9 +52,8 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
-				this.observeLeaves();
-				if (!this.isApplyingLayout) {
-					this.scheduleReorder();
+				if (!this.isReordering) {
+					this.debouncedObserveLeaves();
 				}
 			}),
 		);
@@ -67,6 +65,34 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 		});
 	}
 
+	onunload() {
+		if (this.observeDebounceTimer !== null) {
+			window.clearTimeout(this.observeDebounceTimer);
+			this.observeDebounceTimer = null;
+		}
+		this.reorderScheduled = false;
+		this.isReordering = false;
+	}
+
+	/**
+	 * Debounced version of observeLeaves — waits 200ms after the last
+	 * layout-change before iterating all leaves. Prevents redundant
+	 * iteration on rapid-fire events (tab switches, resizes, etc.).
+	 */
+	private debouncedObserveLeaves() {
+		if (this.observeDebounceTimer !== null) {
+			window.clearTimeout(this.observeDebounceTimer);
+		}
+		this.observeDebounceTimer = window.setTimeout(() => {
+			this.observeDebounceTimer = null;
+			this.observeLeaves();
+		}, 200);
+	}
+
+	/**
+	 * Registers `pinned-change` listeners on any new leaves that haven't
+	 * been observed yet.
+	 */
 	private observeLeaves() {
 		this.app.workspace.iterateAllLeaves((leaf) => {
 			if (this.observedLeaves.has(leaf)) return;
@@ -80,116 +106,180 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 		});
 	}
 
+	/**
+	 * Schedules a reorder pass on the next animation frame. Batches
+	 * multiple triggers within the same frame into a single pass.
+	 */
 	private scheduleReorder() {
-		if (this.reorderScheduled || this.isApplyingLayout) return;
+		if (this.reorderScheduled || this.isReordering) return;
 
 		this.reorderScheduled = true;
 		window.requestAnimationFrame(() => {
 			this.reorderScheduled = false;
-			void this.reorderAllTabs();
+			this.reorderAllTabs();
 		});
 	}
 
-	private async reorderAllTabs() {
-		if (this.isApplyingLayout) return;
+	/**
+	 * Walks the workspace tree and reorders tabs in each tab group so
+	 * pinned tabs come first. Uses in-place manipulation to preserve
+	 * all editor state.
+	 */
+	private reorderAllTabs() {
+		if (this.isReordering) return;
 
-		const layout = this.cloneLayout(this.app.workspace.getLayout());
-		const changed = this.reorderLayoutSnapshot(layout);
-		if (!changed) return;
+		// Quick check: is any reorder actually needed?
+		const tabGroups = this.collectTabGroups();
+		const needsReorder = tabGroups.some((group) => this.tabGroupNeedsReorder(group));
+		if (!needsReorder) return;
 
-		this.isApplyingLayout = true;
+		this.isReordering = true;
 		try {
-			await this.app.workspace.changeLayout(layout);
+			for (const tabGroup of tabGroups) {
+				this.reorderTabGroup(tabGroup);
+			}
 		} finally {
+			// Clear the flag on the next frame so layout-change events
+			// triggered by our own DOM mutations are skipped.
 			window.requestAnimationFrame(() => {
-				this.isApplyingLayout = false;
-				this.observeLeaves();
+				this.isReordering = false;
 			});
 		}
 	}
 
-	private cloneLayout(layout: Record<string, unknown>): WorkspaceLayoutSnapshot {
-		return JSON.parse(JSON.stringify(layout)) as WorkspaceLayoutSnapshot;
+	/**
+	 * Collects all tab groups from the workspace tree by recursively
+	 * walking rootSplit.
+	 */
+	private collectTabGroups(): InternalTabGroup[] {
+		const root = (this.app.workspace as unknown as { rootSplit: InternalSplitNode }).rootSplit;
+		if (!root) return [];
+
+		const groups: InternalTabGroup[] = [];
+		this.walkNode(root, groups);
+		return groups;
 	}
 
-	private reorderLayoutSnapshot(layout: WorkspaceLayoutSnapshot): boolean {
-		let changed = false;
-
-		if (layout.main) {
-			changed = this.reorderLayoutNode(layout.main) || changed;
-		}
-		if (layout.left) {
-			changed = this.reorderLayoutNode(layout.left) || changed;
-		}
-		if (layout.right) {
-			changed = this.reorderLayoutNode(layout.right) || changed;
-		}
-		if (Array.isArray(layout.floating)) {
-			for (const node of layout.floating) {
-				changed = this.reorderLayoutNode(node) || changed;
-			}
+	/**
+	 * Recursively walks a workspace node tree collecting tab groups.
+	 * A tab group is identified as a node that has `tabHeaderEls` and
+	 * `children` where children are leaves (have `pinned` property).
+	 */
+	private walkNode(node: InternalSplitNode | InternalTabGroup, groups: InternalTabGroup[]) {
+		if (this.isTabGroup(node)) {
+			groups.push(node);
+			return;
 		}
 
-		return changed;
-	}
-
-	private reorderLayoutNode(node: WorkspaceLayoutNode): boolean {
-		let changed = false;
-
-		if (node.type === "tabs" && Array.isArray(node.children)) {
-			changed = this.reorderTabGroup(node) || changed;
-		}
-
-		if (!Array.isArray(node.children)) return changed;
+		if (!Array.isArray(node.children)) return;
 
 		for (const child of node.children) {
-			if (this.isLayoutNode(child)) {
-				changed = this.reorderLayoutNode(child) || changed;
-			}
+			this.walkNode(child, groups);
 		}
-
-		return changed;
 	}
 
-	private reorderTabGroup(tabGroup: WorkspaceLayoutNode): boolean {
+	/**
+	 * Type guard: checks if a node is a tab group (has tabHeaderEls array
+	 * and children that are leaves).
+	 */
+	private isTabGroup(node: unknown): node is InternalTabGroup {
+		const n = node as InternalTabGroup;
+		return (
+			Array.isArray(n.children) &&
+			Array.isArray(n.tabHeaderEls) &&
+			n.children.length > 0 &&
+			typeof (n.children[0] as InternalLeaf | undefined)?.pinned !== "undefined"
+		);
+	}
+
+	/**
+	 * Quick check: does this tab group have any pinned tab appearing after
+	 * an unpinned tab? If not, no reorder is needed.
+	 */
+	private tabGroupNeedsReorder(tabGroup: InternalTabGroup): boolean {
 		const children = tabGroup.children;
-		if (!children || children.length <= 1) return false;
-		if (!children.every((child) => this.isLeafLayout(child))) return false;
+		if (children.length <= 1) return false;
 
-		const leaves = children;
-		const pinned = leaves.filter((leaf) => this.isPinnedLeaf(leaf));
-		const unpinned = leaves.filter((leaf) => !this.isPinnedLeaf(leaf));
+		let seenUnpinned = false;
+		for (const leaf of children) {
+			if (!leaf.pinned) {
+				seenUnpinned = true;
+			} else if (seenUnpinned) {
+				// Found a pinned tab after an unpinned one
+				return true;
+			}
+		}
+		return false;
+	}
 
-		if (pinned.length === 0 || unpinned.length === 0) return false;
+	/**
+	 * Reorders a single tab group so pinned tabs come first while
+	 * preserving relative order within each group (pinned-to-pinned,
+	 * unpinned-to-unpinned).
+	 *
+	 * Syncs four things:
+	 * 1. `children[]` — the leaf array (spliced in-place)
+	 * 2. `tabHeaderEls[]` — Obsidian's tracked tab header references
+	 * 3. `currentTab` — index of the active tab
+	 * 4. DOM — tab headers inside `tabsInnerEl`, leaf containers
+	 */
+	private reorderTabGroup(tabGroup: InternalTabGroup) {
+		const children = tabGroup.children;
+		if (children.length <= 1) return;
+
+		const pinned = children.filter((leaf) => leaf.pinned);
+		const unpinned = children.filter((leaf) => !leaf.pinned);
+
+		if (pinned.length === 0 || unpinned.length === 0) return;
 
 		const sorted = [...pinned, ...unpinned];
-		const orderChanged = leaves.some((leaf, index) => leaf !== sorted[index]);
-		if (!orderChanged) return false;
 
-		const currentTabLeaf =
-			typeof tabGroup.currentTab === "number" ? leaves[tabGroup.currentTab] : undefined;
+		// Check if order actually changed
+		const orderChanged = children.some((leaf, i) => leaf !== sorted[i]);
+		if (!orderChanged) return;
 
-		tabGroup.children = sorted;
+		// Save reference to the currently active leaf before reorder
+		const activeLeaf =
+			typeof tabGroup.currentTab === "number" && tabGroup.currentTab < children.length
+				? children[tabGroup.currentTab]
+				: undefined;
 
-		if (currentTabLeaf) {
-			const newIndex = sorted.indexOf(currentTabLeaf);
+		// 1. Splice children array in-place (preserves Obsidian references)
+		children.length = 0;
+		children.push(...sorted);
+
+		// 2. Rebuild tabHeaderEls to match the new children order
+		tabGroup.tabHeaderEls.length = 0;
+		for (const leaf of sorted) {
+			tabGroup.tabHeaderEls.push(leaf.tabHeaderEl);
+		}
+
+		// 3. Update currentTab to point to the same active leaf at its new index
+		if (activeLeaf) {
+			const newIndex = sorted.indexOf(activeLeaf);
 			if (newIndex !== -1) {
 				tabGroup.currentTab = newIndex;
 			}
 		}
 
-		return true;
-	}
+		// 4. Reorder DOM: move tab headers inside tabsInnerEl
+		if (tabGroup.tabsInnerEl) {
+			for (const leaf of sorted) {
+				tabGroup.tabsInnerEl.appendChild(leaf.tabHeaderEl);
+			}
+		}
 
-	private isLayoutNode(child: WorkspaceLayoutChild): child is WorkspaceLayoutNode {
-		return child.type !== "leaf";
-	}
+		// 5. Reorder DOM: move leaf containers
+		const tabContainer = tabGroup.containerEl?.querySelector(".workspace-tab-container");
+		if (tabContainer) {
+			for (const leaf of sorted) {
+				tabContainer.appendChild(leaf.containerEl);
+			}
+		}
 
-	private isLeafLayout(child: WorkspaceLayoutChild): child is WorkspaceLayoutLeaf {
-		return child.type === "leaf";
-	}
-
-	private isPinnedLeaf(leaf: WorkspaceLayoutLeaf): boolean {
-		return leaf.pinned === true || leaf.state?.pinned === true;
+		// Let Obsidian refresh its internal display state
+		if (typeof tabGroup.updateTabDisplay === "function") {
+			tabGroup.updateTabDisplay();
+		}
 	}
 }

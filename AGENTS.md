@@ -13,21 +13,27 @@ Automatically moves pinned tabs to the left side of the tab bar, mimicking brows
 
 ### How it works
 
-The plugin has three layers that must stay in sync:
+The plugin uses **targeted internal-API manipulation** to reorder tabs in-place without rebuilding the workspace. This preserves editor state (scroll position, cursor, undo history, selections).
 
-1. **Method patching** — Obsidian provides no event for pin/unpin state changes. The pin state is tracked purely in the internal `leaf.pinned` property (no DOM class or attribute changes). To detect pin/unpin, the plugin monkey-patches `WorkspaceLeaf.prototype.togglePinned` and `setPinned`, calling `scheduleReorder()` after the original method runs. The original methods are saved and restored on unload.
+1. **Pin-change detection** — Uses the public `leaf.on("pinned-change")` event to detect when a tab is pinned or unpinned. New leaves are observed via a debounced scan triggered by `layout-change` events (200ms debounce to avoid redundant iteration on rapid-fire events like tab switches and resizes).
 
-2. **Internal state reordering** — Walks the `WorkspaceRoot.children` tree (internal API, not public). A "tab group" is identified as a parent node whose children are all leaves (no nested splits). The `children` array is spliced in-place (not replaced) so existing Obsidian references like `activeLeaf` remain valid.
+2. **Internal state reordering** — Walks `app.workspace.rootSplit.children` tree (internal API). A "tab group" is identified as a node with a `tabHeaderEls` array and `children` that are leaves (have a `pinned` property). The `children` array is spliced in-place (not replaced) so existing Obsidian references like `activeLeaf` remain valid.
 
-3. **DOM reordering** — Three things must be kept in sync. If any gets out of sync, `updateTabDisplay` will destroy the reorder or tabs will vanish from the tab bar:
-   - **`tabHeaderEls` array** — Obsidian tracks tab header DOM references in `tabGroup.tabHeaderEls`. This array must be rewritten to match the sorted order. If it's stale, `updateTabDisplay` will remove tabs that aren't in its set from the DOM.
-   - **`currentTab` index** — Obsidian tracks the active tab's index in `tabGroup.currentTab`. When our reorder changes the position of the active tab, `currentTab` must be updated to point to the same leaf at its new index. If it's stale, clicking the tab at the old index will be a no-op (Obsidian's `selectTabIndex` skips activation when `currentTab === index`), and clicking other tabs may activate the wrong one. The fix grabs the active leaf reference from `children[currentTab]` **before** the reorder, then does `indexOf` on the sorted array after.
-   - **Tab headers inside `tabsInnerEl`** — Tab headers live inside the `.workspace-tab-header-container-inner` div (`tabGroup.tabsInnerEl`), **not** directly inside `.workspace-tab-header-container`. **Do not insert tab headers into the outer container** — they must be appended to `tabsInnerEl`. Placing them outside this inner container breaks Obsidian's flex layout and `updateTabDisplay`.
-   - **Leaf containers** (`.workspace-tab-container`) — Leaf container elements can be appended normally.
+3. **DOM and internal state sync** — Four things must be kept in sync after reordering `children`:
+   - **`tabHeaderEls` array** — Obsidian tracks tab header DOM references in `tabGroup.tabHeaderEls`. This array is rebuilt to match the sorted `children` order. If stale, `updateTabDisplay` will remove tabs that aren't in its set from the DOM.
+   - **`currentTab` index** — Obsidian tracks the active tab's index in `tabGroup.currentTab`. The active leaf reference is saved **before** the reorder, then its new index is found with `indexOf` after sorting. If stale, clicking the tab at the old index will be a no-op.
+   - **Tab headers inside `tabsInnerEl`** — Tab headers are re-appended to `tabGroup.tabsInnerEl` (`.workspace-tab-header-container-inner`) in sorted order. **Critical**: They must go into `tabsInnerEl`, not the outer `.workspace-tab-header-container`. Placing them outside breaks `updateTabDisplay` and causes tabs to vanish.
+   - **Leaf containers** — Leaf container elements (`leaf.containerEl`) are re-appended to the `.workspace-tab-container` div in sorted order.
+
+4. **`updateTabDisplay()` call** — After syncing everything, `tabGroup.updateTabDisplay()` is called to let Obsidian refresh its internal display state (widths, visibility, etc.).
 
 ### Re-entry guard
 
-`layout-change` events fire when the DOM is reordered, which would trigger another reorder pass. An `isReordering` flag prevents infinite loops. It's set synchronously and cleared via `requestAnimationFrame` so that layout-change events triggered by our own DOM mutations are skipped.
+`layout-change` events fire when the DOM is reordered, which would trigger another reorder pass. An `isReordering` flag prevents infinite loops. It's set synchronously before DOM manipulation and cleared via `requestAnimationFrame` so that layout-change events triggered by our own DOM mutations are skipped.
+
+### Short-circuit optimization
+
+Before doing any reorder work, the plugin performs a quick O(n) scan: it walks each tab group's `children` array looking for a pinned tab that appears after an unpinned tab. If no such case exists, the entire reorder pass is skipped with no DOM or state changes.
 
 ### Key internal API details
 
@@ -36,15 +42,15 @@ These are not part of the public Obsidian API but are stable internal properties
 | Property | Type | Description |
 |---|---|---|
 | `app.workspace.rootSplit` | `any` | Root of the workspace tree; traversed recursively to find tab groups |
-| `rootSplit.children[n].children` | `any[]` | Leaves in a tab group; spliced in-place during reorder |
-| `rootSplit.children[n].containerEl` | `HTMLElement` | Tab group's root DOM element |
+| `tabGroup.children` | `InternalLeaf[]` | Leaves in a tab group; spliced in-place during reorder |
+| `tabGroup.tabHeaderEls` | `HTMLElement[]` | Obsidian's tracked array of tab-header DOM refs; rebuilt to match sorted order |
+| `tabGroup.currentTab` | `number` | Index of the active tab in `children`; updated after reorder |
+| `tabGroup.tabsInnerEl` | `HTMLElement` | The `.workspace-tab-header-container-inner` div; the actual parent of tab header elements |
+| `tabGroup.containerEl` | `HTMLElement` | Tab group's root DOM element; used to find `.workspace-tab-container` |
+| `tabGroup.updateTabDisplay()` | `function` | Re-renders tabs based on `tabHeaderEls` and `children` |
 | `leaf.pinned` | `boolean` | Whether the leaf/tab is pinned |
 | `leaf.tabHeaderEl` | `HTMLElement` | The `.workspace-tab-header` DOM element for the tab |
 | `leaf.containerEl` | `HTMLElement` | The `.workspace-leaf` DOM element for the tab content |
-| `tabGroup.tabHeaderEls` | `HTMLElement[]` | Obsidian's tracked array of tab-header DOM refs; must be kept in sync with `children` order |
-| `tabGroup.currentTab` | `number` | Index of the active tab in `children`; must be updated after reorder so clicks register correctly |
-| `tabGroup.tabsInnerEl` | `HTMLElement` | The `.workspace-tab-header-container-inner` div; the actual parent of tab header elements |
-| `tabGroup.updateTabDisplay()` | `function` | Re-renders tabs based on `tabHeaderEls` and `children`; calls `setChildrenInPlace` on `tabsInnerEl` |
 
 ### DOM structure of tab header container
 
@@ -97,7 +103,7 @@ npm run build
 
 ```
 src/
-  main.ts           # Complete plugin — method patching, tree walking, DOM reordering
+  main.ts           # Complete plugin — tree walking, in-place reordering, DOM sync
 ```
 
 No settings module — this plugin has no user configuration.
@@ -118,22 +124,19 @@ No settings module — this plugin has no user configuration.
 
 ## Known constraints
 
-- **Internal API reliance**: Uses `app.workspace.rootSplit` and its `.children` tree, which is not part of the public Obsidian API. These have been stable since Obsidian 1.0 but could change in future versions.
-- **Monkey-patching**: `WorkspaceLeaf.prototype.togglePinned` and `setPinned` are patched. These are the only Obsidian-internal methods that change pin state. If another plugin or future Obsidian version adds a different pin code path, a new patch may be needed.
+- **Internal API reliance**: Uses `app.workspace.rootSplit` and its `.children` tree, `tabHeaderEls`, `tabsInnerEl`, `currentTab`, and `updateTabDisplay()` — none of which are part of the public Obsidian API. These have been stable since Obsidian 1.0 but could change in future versions.
 - **No `is-pinned` CSS class**: Obsidian does not add `is-pinned` to tab header DOM elements when a tab is pinned — the state is purely tracked in `leaf.pinned`. A `MutationObserver` on class changes will not work for detecting pin state changes.
-- **Internal `tabHeaderEls` array**: `tabGroup.tabHeaderEls` is Obsidian's tracked array of tab-header DOM elements. It must be rewritten to match the sorted `children` order. If it goes stale, `updateTabDisplay` will remove rearranged tabs from the DOM because it sees them as "not in the set" of expected elements.
-- **`currentTab` index**: `tabGroup.currentTab` tracks the index of the active tab. After reorder, the active leaf may be at a different index. If `currentTab` is not updated, clicking the tab at the stale index will be ignored (Obsidian's `selectTabIndex` skips when `currentTab === index`), or clicking another tab may activate the wrong one. The fix saves `children[currentTab]` before reorder and finds its new index after.
-- **`tabsInnerEl` is the parent of tab headers**: Tab headers live inside `tabGroup.tabsInnerEl` (`.workspace-tab-header-container-inner`), not the outer `.workspace-tab-header-container`. Obsidian's `updateTabDisplay` calls `tabsInnerEl.setChildrenInPlace(...)`, so any tab headers placed outside `tabsInnerEl` will be removed during the next update. Putting tab headers in the outer container also causes a visible gap on the left side of the tab bar.
-- **The `+` new-tab button**: The `.workspace-tab-header-new-tab` button lives inside `.workspace-tab-header-container` (the outer container) and is not reordered — it stays at the far right naturally.
+- **`tabsInnerEl` is the parent of tab headers**: Tab headers live inside `tabGroup.tabsInnerEl` (`.workspace-tab-header-container-inner`), not the outer `.workspace-tab-header-container`. Obsidian's `updateTabDisplay` calls `tabsInnerEl.setChildrenInPlace(...)`, so any tab headers placed outside `tabsInnerEl` will be removed during the next update.
+- **Plugin conflicts**: Other plugins that also reorder tabs or manipulate `rootSplit.children` may conflict.
 
 ## Troubleshooting
 
 - **Pinned tabs not moving**: Check that the plugin is enabled and loaded. Use `obsidian dev:console level=error` to look for errors. Try the manual "Reorder pinned tabs" command.
 - **Large gap to the left of tabs**: Tab headers were placed in the outer `.workspace-tab-header-container` instead of inside `.workspace-tab-header-container-inner` (`tabsInnerEl`). See the architecture section above.
-- **Tabs disappearing from the tab bar**: `tabGroup.tabHeaderEls` got out of sync with `tabGroup.children`. The reorder must rewrite `tabHeaderEls` to match the sorted order, otherwise `updateTabDisplay` removes "unexpected" tabs from the DOM.
+- **Tabs disappearing from the tab bar**: `tabGroup.tabHeaderEls` got out of sync with `tabGroup.children`. The reorder must rebuild `tabHeaderEls` to match the sorted order, otherwise `updateTabDisplay` removes "unexpected" tabs from the DOM.
 - **Tabs shrinking after pinning**: Same root cause — tab headers placed outside `tabsInnerEl`, or `tabHeaderEls`/`currentTab` out of sync, causes `updateTabDisplay` to miscalculate widths.
 - **Clicks not registering after pin**: `tabGroup.currentTab` went stale after the reorder. The active leaf moved to a different index but `currentTab` still pointed at the old one. The fix saves the leaf reference before reordering and finds its new index after.
-- **Plugin conflicts**: Other plugins that also reorder tabs or patch `togglePinned`/`setPinned` may conflict.
+- **Plugin conflicts**: Other plugins that also reorder tabs or manipulate `rootSplit.children` may conflict.
 
 ## References
 
