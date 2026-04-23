@@ -10,7 +10,7 @@
 		"lint": "eslint ."
 	},
 	"keywords": ["obsidian", "pinned-tabs", "tab-order"],
-	"license": "0BSD",
+	"license": "MIT",
 	"devDependencies": {
 		"@types/node": "^16.11.6",
 		"esbuild": "0.25.5",
