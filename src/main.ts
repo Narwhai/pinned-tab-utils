@@ -1,4 +1,4 @@
-import { Plugin, WorkspaceLeaf } from "obsidian";
+import { Plugin, WorkspaceLeaf, WorkspaceTabs } from "obsidian";
 
 /**
  * Internal Obsidian types — not part of the public API but stable since 1.0.
@@ -11,7 +11,7 @@ interface InternalLeaf extends WorkspaceLeaf {
 	containerEl: HTMLElement;
 }
 
-interface InternalTabGroup {
+interface InternalTabGroup extends WorkspaceTabs {
 	children: InternalLeaf[];
 	tabHeaderEls: HTMLElement[];
 	currentTab: number;
@@ -20,18 +20,13 @@ interface InternalTabGroup {
 	updateTabDisplay(): void;
 }
 
-interface InternalSplitNode {
-	children: (InternalTabGroup | InternalSplitNode)[];
-	type?: string;
-}
-
 /**
  * Pinned Tab Utils — automatically moves pinned tabs to the left side of
  * the tab bar, mimicking browser behaviour.
  *
  * Uses targeted internal-API manipulation to reorder tabs in-place:
- * - Detects pin changes via `leaf.on("pinned-change")`
- * - Walks `workspace.rootSplit` to find tab groups
+ * - Detects pin changes via the public `leaf.on("pinned-change")` event
+ * - Uses public `leaf.parent` (WorkspaceTabs) to find the tab group directly
  * - Splices `children[]` in-place, syncs `tabHeaderEls`, `currentTab`,
  *   and DOM nodes inside `tabsInnerEl`
  *
@@ -47,7 +42,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 	async onload() {
 		this.app.workspace.onLayoutReady(() => {
 			this.observeLeaves();
-			this.scheduleReorder();
+			this.scheduleFullReorder();
 		});
 
 		this.registerEvent(
@@ -61,7 +56,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 		this.addCommand({
 			id: "reorder-pinned-tabs",
 			name: "Reorder pinned tabs",
-			callback: () => this.scheduleReorder(),
+			callback: () => this.scheduleFullReorder(),
 		});
 	}
 
@@ -76,8 +71,8 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 
 	/**
 	 * Debounced version of observeLeaves — waits 200ms after the last
-	 * layout-change before iterating all leaves. Prevents redundant
-	 * iteration on rapid-fire events (tab switches, resizes, etc.).
+	 * layout-change before iterating leaves. Prevents redundant iteration
+	 * on rapid-fire events (tab switches, resizes, etc.).
 	 */
 	private debouncedObserveLeaves() {
 		if (this.observeDebounceTimer !== null) {
@@ -86,12 +81,15 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 		this.observeDebounceTimer = window.setTimeout(() => {
 			this.observeDebounceTimer = null;
 			this.observeLeaves();
+			// New leaves from layout changes may need reordering
+			this.scheduleFullReorder();
 		}, 200);
 	}
 
 	/**
 	 * Registers `pinned-change` listeners on any new leaves that haven't
-	 * been observed yet.
+	 * been observed yet. Uses the public `leaf.parent` property to find
+	 * the containing tab group directly, avoiding tree traversal.
 	 */
 	private observeLeaves() {
 		this.app.workspace.iterateAllLeaves((leaf) => {
@@ -100,17 +98,33 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 			this.observedLeaves.add(leaf);
 			this.registerEvent(
 				leaf.on("pinned-change", () => {
-					this.scheduleReorder();
+					// Use leaf.parent to reorder only the affected tab group
+					this.scheduleTargetedReorder(leaf);
 				}),
 			);
 		});
 	}
 
 	/**
-	 * Schedules a reorder pass on the next animation frame. Batches
-	 * multiple triggers within the same frame into a single pass.
+	 * Schedules a targeted reorder of just the tab group containing the
+	 * given leaf. More efficient than a full reorder when we know exactly
+	 * which tab was pinned/unpinned.
 	 */
-	private scheduleReorder() {
+	private scheduleTargetedReorder(leaf: WorkspaceLeaf) {
+		if (this.isReordering) return;
+
+		window.requestAnimationFrame(() => {
+			const tabGroup = this.getTabGroup(leaf);
+			if (!tabGroup) return;
+			this.reorderSingleTabGroup(tabGroup);
+		});
+	}
+
+	/**
+	 * Schedules a full reorder pass across all tab groups on the next
+	 * animation frame. Batches multiple triggers within the same frame.
+	 */
+	private scheduleFullReorder() {
 		if (this.reorderScheduled || this.isReordering) return;
 
 		this.reorderScheduled = true;
@@ -121,14 +135,64 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 	}
 
 	/**
-	 * Walks the workspace tree and reorders tabs in each tab group so
-	 * pinned tabs come first. Uses in-place manipulation to preserve
-	 * all editor state.
+	 * Gets the InternalTabGroup for a leaf using the public `leaf.parent`
+	 * property. Returns null if the parent is not a WorkspaceTabs instance
+	 * (e.g. on mobile it could be WorkspaceMobileDrawer).
+	 */
+	private getTabGroup(leaf: WorkspaceLeaf): InternalTabGroup | null {
+		if (leaf.parent instanceof WorkspaceTabs) {
+			return leaf.parent as InternalTabGroup;
+		}
+		return null;
+	}
+
+	/**
+	 * Collects all unique tab groups by iterating all leaves and using
+	 * their public `parent` property. Covers main area, popout windows,
+	 * sidebars, and floating panes — anywhere a leaf can live.
+	 */
+	private collectTabGroups(): InternalTabGroup[] {
+		const seen = new Set<WorkspaceTabs>();
+		const groups: InternalTabGroup[] = [];
+
+		this.app.workspace.iterateAllLeaves((leaf) => {
+			if (leaf.parent instanceof WorkspaceTabs && !seen.has(leaf.parent)) {
+				seen.add(leaf.parent);
+				const group = leaf.parent as InternalTabGroup;
+				// Verify this is a valid tab group with the expected internal properties
+				if (Array.isArray(group.children) && Array.isArray(group.tabHeaderEls)) {
+					groups.push(group);
+				}
+			}
+		});
+
+		return groups;
+	}
+
+	/**
+	 * Reorders a single tab group with the re-entry guard.
+	 */
+	private reorderSingleTabGroup(tabGroup: InternalTabGroup) {
+		if (this.isReordering) return;
+		if (!this.tabGroupNeedsReorder(tabGroup)) return;
+
+		this.isReordering = true;
+		try {
+			this.reorderTabGroup(tabGroup);
+		} finally {
+			window.requestAnimationFrame(() => {
+				this.isReordering = false;
+			});
+		}
+	}
+
+	/**
+	 * Walks all tab groups and reorders tabs so pinned tabs come first.
+	 * Uses in-place manipulation to preserve all editor state.
 	 */
 	private reorderAllTabs() {
 		if (this.isReordering) return;
 
-		// Quick check: is any reorder actually needed?
 		const tabGroups = this.collectTabGroups();
 		const needsReorder = tabGroups.some((group) => this.tabGroupNeedsReorder(group));
 		if (!needsReorder) return;
@@ -139,57 +203,10 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 				this.reorderTabGroup(tabGroup);
 			}
 		} finally {
-			// Clear the flag on the next frame so layout-change events
-			// triggered by our own DOM mutations are skipped.
 			window.requestAnimationFrame(() => {
 				this.isReordering = false;
 			});
 		}
-	}
-
-	/**
-	 * Collects all tab groups from the workspace tree by recursively
-	 * walking rootSplit.
-	 */
-	private collectTabGroups(): InternalTabGroup[] {
-		const root = (this.app.workspace as unknown as { rootSplit: InternalSplitNode }).rootSplit;
-		if (!root) return [];
-
-		const groups: InternalTabGroup[] = [];
-		this.walkNode(root, groups);
-		return groups;
-	}
-
-	/**
-	 * Recursively walks a workspace node tree collecting tab groups.
-	 * A tab group is identified as a node that has `tabHeaderEls` and
-	 * `children` where children are leaves (have `pinned` property).
-	 */
-	private walkNode(node: InternalSplitNode | InternalTabGroup, groups: InternalTabGroup[]) {
-		if (this.isTabGroup(node)) {
-			groups.push(node);
-			return;
-		}
-
-		if (!Array.isArray(node.children)) return;
-
-		for (const child of node.children) {
-			this.walkNode(child, groups);
-		}
-	}
-
-	/**
-	 * Type guard: checks if a node is a tab group (has tabHeaderEls array
-	 * and children that are leaves).
-	 */
-	private isTabGroup(node: unknown): node is InternalTabGroup {
-		const n = node as InternalTabGroup;
-		return (
-			Array.isArray(n.children) &&
-			Array.isArray(n.tabHeaderEls) &&
-			n.children.length > 0 &&
-			typeof (n.children[0] as InternalLeaf | undefined)?.pinned !== "undefined"
-		);
 	}
 
 	/**
@@ -205,7 +222,6 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 			if (!leaf.pinned) {
 				seenUnpinned = true;
 			} else if (seenUnpinned) {
-				// Found a pinned tab after an unpinned one
 				return true;
 			}
 		}
