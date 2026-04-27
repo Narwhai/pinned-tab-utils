@@ -53,8 +53,8 @@ jobs:
           fi
 
       - name: Create GitHub release
-		env:
-			GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ steps.vars.outputs.tag }}" \
             --title "${{ steps.vars.outputs.tag }}" \
