@@ -62,7 +62,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 
 	onunload() {
 		if (this.observeDebounceTimer !== null) {
-			window.clearTimeout(this.observeDebounceTimer);
+			activeWindow.clearTimeout(this.observeDebounceTimer);
 			this.observeDebounceTimer = null;
 		}
 		this.reorderScheduled = false;
@@ -76,9 +76,9 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 	 */
 	private debouncedObserveLeaves() {
 		if (this.observeDebounceTimer !== null) {
-			window.clearTimeout(this.observeDebounceTimer);
+			activeWindow.clearTimeout(this.observeDebounceTimer);
 		}
-		this.observeDebounceTimer = window.setTimeout(() => {
+		this.observeDebounceTimer = activeWindow.setTimeout(() => {
 			this.observeDebounceTimer = null;
 			this.observeLeaves();
 			// New leaves from layout changes may need reordering
@@ -113,7 +113,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 	private scheduleTargetedReorder(leaf: WorkspaceLeaf) {
 		if (this.isReordering) return;
 
-		window.requestAnimationFrame(() => {
+		activeWindow.requestAnimationFrame(() => {
 			const tabGroup = this.getTabGroup(leaf);
 			if (!tabGroup) return;
 			this.reorderSingleTabGroup(tabGroup);
@@ -128,7 +128,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 		if (this.reorderScheduled || this.isReordering) return;
 
 		this.reorderScheduled = true;
-		window.requestAnimationFrame(() => {
+		activeWindow.requestAnimationFrame(() => {
 			this.reorderScheduled = false;
 			this.reorderAllTabs();
 		});
@@ -180,7 +180,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 		try {
 			this.reorderTabGroup(tabGroup);
 		} finally {
-			window.requestAnimationFrame(() => {
+			activeWindow.requestAnimationFrame(() => {
 				this.isReordering = false;
 			});
 		}
@@ -203,7 +203,7 @@ export default class PinnedTabUtilsPlugin extends Plugin {
 				this.reorderTabGroup(tabGroup);
 			}
 		} finally {
-			window.requestAnimationFrame(() => {
+			activeWindow.requestAnimationFrame(() => {
 				this.isReordering = false;
 			});
 		}
