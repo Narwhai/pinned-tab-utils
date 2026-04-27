@@ -10,6 +10,11 @@ on:
         description: "Tag to release (must already exist)"
         required: true
 
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,6 +33,13 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            main.js
+            styles.css
+
       - name: Create release zip
         run: zip pinned-tab-utils.zip main.js manifest.json styles.css
 
@@ -41,8 +53,6 @@ jobs:
           fi
 
       - name: Create GitHub release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ steps.vars.outputs.tag }}" \
             --title "${{ steps.vars.outputs.tag }}" \
